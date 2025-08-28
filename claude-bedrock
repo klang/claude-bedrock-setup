@@ -1,0 +1,645 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Claude Bedrock AWS Configuration Script
+# This script sets up the necessary AWS environment for Claude Code with Bedrock
+# Usage: claude-bedrock [--profile PROFILE_NAME] [--region REGION] [--model MODEL] [claude args...]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION 
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Default location for configuration file
+readonly CONFIG_FILE="${HOME}/.claude-bedrock"
+
+# Minimal fallback defaults if no config exists
+DEFAULT_AWS_PROFILE="default"
+DEFAULT_AWS_REGION="eu-west-1"
+DEFAULT_ANTHROPIC_MODEL="eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+
+# Variables that will be populated from config or command line
+SELECTED_AWS_PROFILE=""
+SELECTED_AWS_REGION=""
+SELECTED_ANTHROPIC_MODEL=""
+SELECTED_ANTHROPIC_SMALL_FAST_MODEL=""
+SELECTED_CONFIG_PROFILE="default"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Read and parse config file
+read_config() {
+    local config_file="$1"
+    local selected_profile="$2"
+    local debug_mode="$3"
+    
+    # Check if config file exists
+    if [[ ! -f "$config_file" ]]; then
+        if [[ "$debug_mode" == "true" ]]; then
+            log_info "Config file not found: $config_file"
+        fi
+        return 1
+    fi
+    
+    if [[ "$debug_mode" == "true" ]]; then
+        log_info "Reading config from: $config_file"
+        log_info "Loading profile: $selected_profile"
+    fi
+    
+    # Prepare to read from config
+    local current_section=""
+    local found_profile=false
+    local line_number=0
+    
+    # Read line by line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_number=$((line_number + 1))
+        
+        # Skip empty lines and comments
+        if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+            continue
+        fi
+        
+        # Trim leading/trailing whitespace
+        line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        
+        # Check if this is a section header
+        if [[ "$line" =~ ^\[([^]]+)\]$ ]]; then
+            current_section="${BASH_REMATCH[1]}"
+            if [[ "$current_section" == "$selected_profile" ]]; then
+                found_profile=true
+                if [[ "$debug_mode" == "true" ]]; then
+                    log_info "Found selected profile section: [$current_section]"
+                fi
+            fi
+            continue
+        fi
+        
+        # Process key-value pairs in the current section
+        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            
+            # Remove quotes if present
+            value="${value//\"}"
+            
+            # Trim key and value
+            key="$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            value="$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            
+            # Process values for the selected profile
+            if [[ "$current_section" == "$selected_profile" ]]; then
+                case "$key" in
+                    aws_profile)
+                        SELECTED_AWS_PROFILE="$value"
+                        ;;
+                    aws_region)
+                        SELECTED_AWS_REGION="$value"
+                        ;;
+                    anthropic_model)
+                        SELECTED_ANTHROPIC_MODEL="$value"
+                        ;;
+                    anthropic_small_fast_model)
+                        SELECTED_ANTHROPIC_SMALL_FAST_MODEL="$value"
+                        ;;
+                    *)
+                        if [[ "$debug_mode" == "true" ]]; then
+                            log_warning "Unknown config key: $key in profile $current_section"
+                        fi
+                        ;;
+                esac
+                if [[ "$debug_mode" == "true" ]]; then
+                    log_info "Setting $key = $value from profile [$current_section]"
+                fi
+            fi
+        else
+            # If line doesn't match key-value format in a section
+            if [[ -n "$current_section" ]] && [[ "$debug_mode" == "true" ]]; then
+                log_warning "Invalid line at $line_number in config: $line"
+            fi
+        fi
+    done < "$config_file"
+    
+    # Check if we found the requested profile
+    if [[ "$found_profile" == "false" ]] && [[ "$selected_profile" != "default" ]]; then
+        if [[ "$debug_mode" == "true" ]]; then
+            log_warning "Requested profile '$selected_profile' not found in config"
+            log_info "Falling back to 'default' profile"
+        fi
+        # Try again with default profile
+        read_config "$config_file" "default" "$debug_mode"
+    fi
+}
+
+# Create sample config file if it doesn't exist
+create_sample_config() {
+    local config_file="$1"
+    
+    if [[ -f "$config_file" ]]; then
+        log_info "Config file already exists at $config_file"
+        return 0
+    fi
+    
+    log_info "Creating sample configuration at $config_file"
+    
+    # Create directory if it doesn't exist
+    local config_dir="$(dirname "$config_file")"
+    if [[ ! -d "$config_dir" ]] && [[ "$config_dir" != "." ]]; then
+        mkdir -p "$config_dir"
+    fi
+    
+    # Create sample config file
+    cat > "$config_file" << EOL
+# Claude Bedrock Configuration File
+# This file configures the Claude Bedrock wrapper for AWS
+
+[default]
+# Default profile settings
+aws_profile = default
+aws_region = 
+# Default to latest Sonnet model
+anthropic_model = eu.anthropic.claude-3-7-sonnet-20250219-v1:0
+# Optional small fast model (leave empty if not needed)
+anthropic_small_fast_model = 
+
+# Example profiles (uncomment and modify as needed)
+
+#[sonnet]
+#aws_profile = your-aws-profile
+#aws_region = eu-west-1
+#anthropic_model = eu.anthropic.claude-3-7-sonnet-20250219-v1:0
+#anthropic_small_fast_model = eu.anthropic.claude-3-7-haiku-20250818-v1:0
+
+#[opus]
+#aws_profile = your-aws-profile
+#aws_region = eu-west-1
+#anthropic_model = eu.anthropic.claude-3-7-opus-20250118-v1:0
+#anthropic_small_fast_model = eu.anthropic.claude-3-7-haiku-20250818-v1:0
+
+#[prod]
+#aws_profile = prod-profile
+#aws_region = us-east-1
+#anthropic_model = claude-3-sonnet-20240229-v1:0
+
+#[dev]
+# If region is left empty, uses default region from AWS config
+#aws_profile = dev-profile
+#aws_region = 
+#anthropic_model = eu.anthropic.claude-3-7-sonnet-20250219-v1:0
+EOL
+    
+    log_success "Sample configuration created at $config_file"
+    log_info "Please edit this file to set your preferred defaults"
+    
+    # Set appropriate permissions
+    chmod 600 "$config_file"
+    
+    return 0
+}
+
+# Parse command line arguments
+parse_arguments() {
+    # Initialize empty array for Claude arguments
+    CLAUDE_ARGS=()
+    SHOW_DEBUG=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --profile)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --profile requires an argument"
+                    show_help
+                    exit 1
+                fi
+                SELECTED_CONFIG_PROFILE="$2"
+                shift 2
+                ;;
+            --aws-profile)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --aws-profile requires an argument"
+                    show_help
+                    exit 1
+                fi
+                SELECTED_AWS_PROFILE="$2"
+                shift 2
+                ;;
+            --region)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --region requires an argument"
+                    show_help
+                    exit 1
+                fi
+                SELECTED_AWS_REGION="$2"
+                shift 2
+                ;;
+            --model)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --model requires an argument"
+                    show_help
+                    exit 1
+                fi
+                SELECTED_ANTHROPIC_MODEL="$2"
+                shift 2
+                ;;
+            --small-fast-model)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --small-fast-model requires an argument"
+                    show_help
+                    exit 1
+                fi
+                SELECTED_ANTHROPIC_SMALL_FAST_MODEL="$2"
+                shift 2
+                ;;
+            --debug)
+                SHOW_DEBUG=true
+                shift
+                ;;
+            --init)
+                create_sample_config "$CONFIG_FILE"
+                exit 0
+                ;;
+            --*)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            -*)
+                # Claude arguments start here (like -p, --print, etc.)
+                break
+                ;;
+            *)
+                # First non-flag argument is profile for backward compatibility
+                if [[ -z "$SELECTED_CONFIG_PROFILE" ]] || [[ "$SELECTED_CONFIG_PROFILE" == "default" ]]; then
+                    SELECTED_CONFIG_PROFILE="$1"
+                    shift
+                else
+                    # All remaining arguments go to Claude
+                    break
+                fi
+                ;;
+        esac
+    done
+    
+    # Remaining arguments are passed to Claude
+    CLAUDE_ARGS+=("$@")
+}
+
+# Colors for output (Claude-style with better compatibility)
+readonly ORANGE='\033[38;2;255;165;0m'  # Claude's orange (RGB)
+readonly GREEN='\033[0;32m'             # Success green
+readonly YELLOW='\033[1;33m'            # Warning yellow
+readonly RED='\033[0;31m'               # Error red
+readonly GRAY='\033[90m'                # Subtle gray (bright black)
+readonly NC='\033[0m'                   # No Color
+readonly BOLD='\033[1m'                 # Bold text
+
+# Simple logging functions
+log_info() {
+    echo -e "  ${GRAY}$1${NC}"
+}
+
+log_success() {
+    echo -e "  ${GREEN}✓${NC} $1"
+}
+
+log_warning() {
+    echo -e "  ${YELLOW}⚠${NC} $1"
+}
+
+log_error() {
+    echo -e "  ${RED}✗${NC} $1"
+}
+
+# Check if AWS CLI is installed
+check_aws_cli() {
+    if ! command -v aws &> /dev/null; then
+        log_error "AWS CLI is not installed. Please install it first."
+        exit 1
+    fi
+}
+
+# Validate AWS credentials using STS
+validate_credentials() {
+    log_info "Validating AWS credentials for profile: ${SELECTED_AWS_PROFILE}"
+    
+    local region_args=()
+    if [[ -n "${SELECTED_AWS_REGION}" ]]; then
+        region_args=(--region "${SELECTED_AWS_REGION}")
+    fi
+    
+    if aws sts get-caller-identity --profile "${SELECTED_AWS_PROFILE}" ${region_args[@]:-} &> /dev/null; then
+        local identity
+        identity=$(aws sts get-caller-identity --profile "${SELECTED_AWS_PROFILE}" ${region_args[@]:-} --output json)
+        local user_id
+        user_id=$(echo "${identity}" | jq -r '.UserId // .Arn' 2>/dev/null | cut -d':' -f2 || echo "Unknown")
+        log_success "AWS credentials validated for ${GRAY}${user_id}${NC}"
+        return 0
+    else
+        log_warning "AWS credentials are invalid or expired for profile: ${SELECTED_AWS_PROFILE}"
+        return 1
+    fi
+}
+
+# Perform AWS SSO login
+perform_sso_login() {
+    log_info "Attempting AWS SSO login for profile: ${SELECTED_AWS_PROFILE}"
+    
+    if aws sso login --profile "${SELECTED_AWS_PROFILE}"; then
+        log_success "AWS SSO login successful"
+        return 0
+    else
+        log_error "AWS SSO login failed"
+        return 1
+    fi
+}
+
+# Helper function to check if a variable is readonly
+is_readonly() {
+    local var_name="$1"
+    declare -p "$var_name" 2>/dev/null | grep -q "declare -r"
+}
+
+# Set environment variables
+set_environment_variables() {
+    log_info "Setting Claude Bedrock environment variables"
+    
+    # Set AWS_REGION if not readonly and not already correct
+    if ! is_readonly "AWS_REGION"; then
+        if [[ -n "${SELECTED_AWS_REGION}" ]]; then
+            if [[ -z "${AWS_REGION:-}" ]] || [[ "${AWS_REGION}" != "${SELECTED_AWS_REGION}" ]]; then
+                export AWS_REGION="${SELECTED_AWS_REGION}"
+            fi
+        fi
+    elif [[ -n "${SELECTED_AWS_REGION}" ]] && [[ "${AWS_REGION:-}" != "${SELECTED_AWS_REGION}" ]]; then
+        log_warning "AWS_REGION is readonly and set to '${AWS_REGION}', expected '${SELECTED_AWS_REGION}'"
+    fi
+    
+    # Set AWS_PROFILE if not readonly and not already correct
+    if ! is_readonly "AWS_PROFILE"; then
+        if [[ -z "${AWS_PROFILE:-}" ]] || [[ "${AWS_PROFILE}" != "${SELECTED_AWS_PROFILE}" ]]; then
+            export AWS_PROFILE="${SELECTED_AWS_PROFILE}"
+        fi
+    elif [[ "${AWS_PROFILE:-}" != "${SELECTED_AWS_PROFILE}" ]]; then
+        log_warning "AWS_PROFILE is readonly and set to '${AWS_PROFILE}', expected '${SELECTED_AWS_PROFILE}'"
+    fi
+    
+    # Set CLAUDE_CODE_USE_BEDROCK if not readonly
+    if ! is_readonly "CLAUDE_CODE_USE_BEDROCK"; then
+        export CLAUDE_CODE_USE_BEDROCK=1
+    elif [[ "${CLAUDE_CODE_USE_BEDROCK:-}" != "1" ]]; then
+        log_warning "CLAUDE_CODE_USE_BEDROCK is readonly and set to '${CLAUDE_CODE_USE_BEDROCK}', expected '1'"
+    fi
+    
+    # Set ANTHROPIC_MODEL if not readonly
+    if ! is_readonly "ANTHROPIC_MODEL"; then
+        if [[ -n "${SELECTED_ANTHROPIC_MODEL}" ]]; then
+            export ANTHROPIC_MODEL="${SELECTED_ANTHROPIC_MODEL}"
+        fi
+    elif [[ -n "${SELECTED_ANTHROPIC_MODEL}" ]] && [[ "${ANTHROPIC_MODEL:-}" != "${SELECTED_ANTHROPIC_MODEL}" ]]; then
+        log_warning "ANTHROPIC_MODEL is readonly and set to '${ANTHROPIC_MODEL}', expected '${SELECTED_ANTHROPIC_MODEL}'"
+    fi
+    
+    # Set ANTHROPIC_SMALL_FAST_MODEL if not readonly and if a value is provided
+    if ! is_readonly "ANTHROPIC_SMALL_FAST_MODEL"; then
+        if [[ -n "${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}" ]]; then
+            export ANTHROPIC_SMALL_FAST_MODEL="${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}"
+        fi
+    elif [[ -n "${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}" ]] && [[ "${ANTHROPIC_SMALL_FAST_MODEL:-}" != "${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}" ]]; then
+        log_warning "ANTHROPIC_SMALL_FAST_MODEL is readonly and set to '${ANTHROPIC_SMALL_FAST_MODEL}', expected '${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}'"
+    fi
+    
+    log_success "Environment variables verified/set:"
+    if [[ -n "${AWS_REGION:-}" ]]; then
+        echo "  AWS_REGION=${AWS_REGION}"
+    else
+        echo "  AWS_REGION=<using profile default>"
+    fi
+    echo "  AWS_PROFILE=${AWS_PROFILE}"
+    echo "  CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-1}"
+    echo "  ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
+    if [[ -n "${ANTHROPIC_SMALL_FAST_MODEL:-}" ]]; then
+        echo "  ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL}"
+    fi
+}
+
+# Verify Bedrock access
+verify_bedrock_access() {
+    log_info "Verifying Bedrock access"
+    
+    local region_args=()
+    if [[ -n "${SELECTED_AWS_REGION}" ]]; then
+        region_args=(--region "${SELECTED_AWS_REGION}")
+    fi
+    
+    if aws bedrock list-foundation-models --profile "${SELECTED_AWS_PROFILE}" ${region_args[@]:-} &> /dev/null; then
+        log_success "Bedrock access verified"
+        return 0
+    else
+        log_warning "Cannot verify Bedrock access. You may not have the necessary permissions."
+        return 1
+    fi
+}
+
+# Launch Claude Code
+launch_claude() {
+    # Check if claude command exists
+    if ! command -v claude &> /dev/null; then
+        log_error "Claude Code CLI not found. Please install it first."
+        exit 1
+    fi
+    
+    # Prepare environment variables for Claude Code
+    local env_vars=("AWS_PROFILE=${SELECTED_AWS_PROFILE}" "CLAUDE_CODE_USE_BEDROCK=1")
+    
+    # Add region if specified
+    if [[ -n "${SELECTED_AWS_REGION}" ]]; then
+        env_vars+=("AWS_REGION=${SELECTED_AWS_REGION}")
+    fi
+    
+    # Add model if specified
+    if [[ -n "${SELECTED_ANTHROPIC_MODEL}" ]]; then
+        env_vars+=("ANTHROPIC_MODEL=${SELECTED_ANTHROPIC_MODEL}")
+    fi
+    
+    # Add small fast model if specified
+    if [[ -n "${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}" ]]; then
+        env_vars+=("ANTHROPIC_SMALL_FAST_MODEL=${SELECTED_ANTHROPIC_SMALL_FAST_MODEL}")
+    fi
+    
+    # Disable AWS SDK environment credentials provider to prevent warnings
+    env_vars+=("AWS_SDK_LOAD_CONFIG=1" "AWS_EC2_METADATA_DISABLED=true")
+    
+    # Launch Claude Code with explicit environment variables
+    if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+        env "${env_vars[@]}" claude "${CLAUDE_ARGS[@]}"
+    else
+        env "${env_vars[@]}" claude
+    fi
+}
+
+# Simple header without box
+draw_header() {
+    local profile="$1"
+    
+    echo
+    echo -e "${ORANGE}🔧 ${BOLD}Claude Bedrock Setup${NC}"
+    echo -e "${GRAY}Profile: ${profile}${NC}"
+    echo -e "${GRAY}Setting up AWS environment for Claude Code${NC}"
+    echo
+}
+
+# Show help information
+show_help() {
+    echo
+    echo -e "${ORANGE}🔧 ${BOLD}Claude Bedrock Setup${NC} - AWS environment wrapper for Claude Code"
+    echo
+    echo -e "${BOLD}USAGE:${NC}"
+    echo -e "  ${GRAY}claude-bedrock [options] [claude-args...]${NC}"
+    echo
+    echo -e "${BOLD}OPTIONS:${NC}"
+    echo -e "  ${GREEN}--profile NAME${NC}        Use named configuration profile (default: default)"
+    echo -e "  ${GREEN}--aws-profile PROFILE${NC} Override AWS profile (overrides config file)"
+    echo -e "  ${GREEN}--region REGION${NC}      Override AWS region (overrides config file)"
+    echo -e "  ${GREEN}--model MODEL${NC}        Override Anthropic model (overrides config file)"
+    echo -e "  ${GREEN}--small-fast-model MODEL${NC} Override Anthropic small fast model (overrides config file)"
+    echo -e "  ${GREEN}--init${NC}               Create a sample configuration file"
+    echo -e "  ${GREEN}--debug${NC}              Show detailed debug information"
+    echo -e "  ${GREEN}-h, --help${NC}           Show this help message"
+    echo
+    echo -e "${BOLD}EXAMPLES:${NC}"
+    echo -e "  ${GRAY}# Use default settings${NC}"
+    echo -e "  claude-bedrock"
+    echo
+    echo -e "  ${GRAY}# Use a named profile from config${NC}"
+    echo -e "  claude-bedrock --profile opus"
+    echo -e "  claude-bedrock opus  # shorthand version"
+    echo
+    echo -e "  ${GRAY}# Override specific settings${NC}"
+    echo -e "  claude-bedrock --profile prod --region us-west-2"
+    echo
+    echo -e "  ${GRAY}# Pass arguments to Claude Code${NC}"
+    echo -e "  claude-bedrock --profile prod some-file.py"
+    echo -e "  claude-bedrock prod some-file.py"
+    echo
+    echo -e "${BOLD}CONFIGURATION FILE:${NC}"
+    echo -e "  ${GRAY}Location:${NC} ${CONFIG_FILE}"
+    echo
+    echo -e "  ${GRAY}# Example configuration:${NC}"
+    echo -e "  ${GRAY}[default]${NC}"
+    echo -e "  ${GRAY}aws_profile = default${NC}"
+    echo -e "  ${GRAY}aws_region = eu-west-1${NC}"
+    echo -e "  ${GRAY}anthropic_model = eu.anthropic.claude-3-7-sonnet-20250219-v1:0${NC}"
+    echo -e "  ${GRAY}anthropic_small_fast_model = eu.anthropic.claude-3-7-haiku-20250818-v1:0${NC}"
+    echo
+    echo -e "  ${GRAY}[sonnet]${NC}"
+    echo -e "  ${GRAY}aws_profile = my-aws-profile${NC}"
+    echo -e "  ${GRAY}aws_region = eu-west-1${NC}"
+    echo -e "  ${GRAY}anthropic_model = eu.anthropic.claude-3-7-sonnet-20250219-v1:0${NC}"
+    echo
+    echo -e "  ${GRAY}[opus]${NC}"
+    echo -e "  ${GRAY}aws_profile = my-aws-profile${NC}"
+    echo -e "  ${GRAY}aws_region = eu-west-1${NC}"
+    echo -e "  ${GRAY}anthropic_model = eu.anthropic.claude-3-7-opus-20250118-v1:0${NC}"
+    echo
+    echo -e "${BOLD}REQUIREMENTS:${NC}"
+    echo -e "  ${GREEN}✓${NC} AWS CLI installed and configured"
+    echo -e "  ${GREEN}✓${NC} AWS SSO configured for your profile"
+    echo -e "  ${GREEN}✓${NC} Claude Code CLI installed"
+    echo -e "  ${GREEN}✓${NC} Bedrock access permissions"
+    echo
+}
+
+# Apply selected configuration
+apply_configuration() {
+    # Try to load from config file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        read_config "$CONFIG_FILE" "$SELECTED_CONFIG_PROFILE" "$SHOW_DEBUG"
+    elif [[ "$SHOW_DEBUG" == "true" ]]; then
+        log_info "No config file found at $CONFIG_FILE"
+    fi
+
+    # Apply fallback defaults for any values that are still empty
+    if [[ -z "$SELECTED_AWS_PROFILE" ]]; then
+        SELECTED_AWS_PROFILE="$DEFAULT_AWS_PROFILE"
+        if [[ "$SHOW_DEBUG" == "true" ]]; then
+            log_info "Using default AWS profile: $SELECTED_AWS_PROFILE"
+        fi
+    fi
+    
+    if [[ -z "$SELECTED_ANTHROPIC_MODEL" ]]; then
+        SELECTED_ANTHROPIC_MODEL="$DEFAULT_ANTHROPIC_MODEL"
+        if [[ "$SHOW_DEBUG" == "true" ]]; then
+            log_info "Using default Anthropic model: $SELECTED_ANTHROPIC_MODEL"
+        fi
+    fi
+    
+    # AWS Region can be empty - will use profile's default region
+}
+
+# Main execution
+main() {
+    # Parse command line arguments first
+    parse_arguments "$@"
+    
+    # Load and apply configuration (with command line args taking precedence)
+    apply_configuration
+    
+    # If no config file exists, offer to create one
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}No config file found at $CONFIG_FILE${NC}"
+        read -p "Would you like to create a sample configuration file? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            create_sample_config "$CONFIG_FILE"
+            echo -e "${YELLOW}Please edit the configuration and run again.${NC}"
+            exit 0
+        fi
+    fi
+    
+    draw_header "${SELECTED_CONFIG_PROFILE} (AWS: ${SELECTED_AWS_PROFILE})"
+    
+    # Check prerequisites
+    check_aws_cli
+    
+    # Validate or refresh credentials
+    if ! validate_credentials; then
+        if ! perform_sso_login; then
+            log_error "Authentication failed"
+            exit 1
+        fi
+        if ! validate_credentials; then
+            log_error "Credentials still invalid after SSO login"
+            exit 1
+        fi
+    fi
+    
+    # Set environment variables
+    if [[ "$SHOW_DEBUG" == "false" ]]; then
+        set_environment_variables > /dev/null 2>&1
+    else
+        set_environment_variables
+    fi
+    
+    # Verify Bedrock access
+    if [[ "$SHOW_DEBUG" == "false" ]]; then
+        verify_bedrock_access > /dev/null 2>&1
+    else
+        verify_bedrock_access
+    fi
+    
+    echo -e "  ${GREEN}✓${NC} ${BOLD}Ready!${NC} ${GRAY}Launching Claude Code...${NC}"
+    echo
+    
+    # Launch Claude Code
+    launch_claude
+}
+
+# Run main function if script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
